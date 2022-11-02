@@ -18,7 +18,7 @@ metadata:
   name: istio-egressgateway
   labels:
     app: istio-egressgateway
-    istio: egressgateway
+    istio: egressgateway  
 spec:
   ports:
   # Any ports exposed in Gateway resources should be exposed here.

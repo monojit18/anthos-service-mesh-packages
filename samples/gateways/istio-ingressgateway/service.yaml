@@ -18,6 +18,8 @@ metadata:
   labels:
     app: istio-ingressgateway
     istio: ingressgateway
+  # annotations:
+  #       cloud.google.com/load-balancer-type: "Internal"
 spec:
   ports:
   # status-port exposes a /healthz/ready endpoint that can be used with GKE Ingress health checks
@@ -34,3 +36,4 @@ spec:
     istio: ingressgateway
     app: istio-ingressgateway
   type: LoadBalancer
+  # loadBalancerIP: 14.0.0.100

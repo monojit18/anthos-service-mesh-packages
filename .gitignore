@@ -1,3 +1,4 @@
+!.gitignore
 .idea
 *.iml
 .vscode
@@ -12,3 +13,7 @@
 dist/
 bazel-*
 node_modules/
+misc/**
+!misc/commands.tpl.txt
+**/addons
+

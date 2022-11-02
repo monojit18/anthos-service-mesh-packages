@@ -1,0 +1,220 @@
+Anthos Service Mesh
+====================
+REGION=""
+PROJECTID=""
+CLUSTER=""
+GSA=""
+ROOTPATH=""
+BASEPATH="${ROOTPATH}/samples"
+ISTIOPATH="${BASEPATH}/product-catalogue/istio-manifests"
+
+gcloud compute networks create asm-vpc --project=cloud-native-project-spoke --subnet-mode=custom --mtu=1460 \
+--bgp-routing-mode=regional
+# gcloud compute networks delete asm-vpc
+
+gcloud compute firewall-rules create allow-asm-ssh-spoke-rule --network asm-vpc --allow tcp:22 --source-ranges=0.0.0.0/0
+# gcloud compute firewall-rules delete allow-asm-ssh-spoke-rule
+
+gcloud compute networks subnets create asm-gke-subnet --network=asm-vpc --range=14.0.0.0/22
+# gcloud compute networks subnets delete asm-gke-subnet
+
+gcloud compute firewall-rules create allow-asm-spoke-health-check --network=asm-vpc \
+--action=allow --direction=ingress --source-ranges=130.211.0.0/22,35.191.0.0/16 --rules=tcp
+# gcloud compute firewall-rules delete allow-asm-spoke-health-check
+
+gcloud compute networks subnets update asm-gke-subnet \
+--add-secondary-ranges=pods-range=14.1.0.0/16,services-range=14.2.0.0/16
+# gcloud compute networks subnets delete asm-gke-subnet
+
+gcloud container clusters create $CLUSTER \
+    --project=$PROJECTID \
+    --network=asm-vpc --subnetwork=asm-gke-subnet \
+    --machine-type=e2-standard-4  \
+    --region=$REGION --num-nodes=1  --max-nodes=3 \
+    --service-account=$GSA --enable-ip-alias --enable-autoscaling \
+    --cluster-secondary-range-name=pods-range --services-secondary-range-name=services-range \
+    --workload-pool=$PROJECTID.svc.id.goog
+#gcloud container clusters delete $CLUSTER --project=$PROJECTID --region=$REGION
+
+gcloud container clusters update $CLUSTER --region=$REGION --project=$PROJECTID \
+  --monitoring=SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER
+
+gcloud beta container clusters update $CLUSTER --enable-managed-prometheus --region $REGION
+
+gcloud container clusters get-credentials $CLUSTER --region=$REGION --project=$PROJECTID
+
+gcloud container node-pools create gkeasmpool --cluster=$CLUSTER \
+--region=asia-southeast1 --machine-type=e2-standard-4 --num-nodes=1 \
+--enable-autoscaling --max-nodes=1 --min-nodes=1 --max-pods-per-node=30
+#gcloud container node-pools delete gkeasmpool --cluster=$CLUSTER --region=asia-southeast1
+
+gcloud container node-pools update gkeasmpool \
+--cluster=$CLUSTER --workload-metadata=GKE_METADATA --region=asia-southeast1
+
+#gcloud container clusters update $CLUSTER --region=$REGION --update-labels mesh_id=proj-$PROJECTID
+
+#MONITORING
+============
+kubectl -n default apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/prometheus-engine/v0.5.0/examples/example-app.yaml
+
+#kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/prometheus-engine/v0.1.1/examples/setup.yaml
+#kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/prometheus-engine/v0.1.1/examples/operator.yaml
+
+vi ./pod-monitor.yaml
+=========================
+apiVersion: monitoring.googleapis.com/v1
+kind: ClusterPodMonitoring
+metadata:
+  name: prom-example
+spec:
+  selector:
+    matchLabels:
+      app: prom-example
+  endpoints:
+  - port: metrics
+    interval: 30s
+=========================
+k apply -f ./pod-monitor.yaml
+#k delete -f ./pod-monitor.yaml
+
+#Run this in Cloud Shell
+==========================
+curl https://storage.googleapis.com/csm-artifacts/asm/asmcli_1.14 > asmcli
+chmod +x asmcli
+./asmcli install \
+  --project_id $PROJECTID \
+  --cluster_name $CLUSTER \
+  --cluster_location asia-southeast1 \
+  --fleet_id $PROJECTID \
+  --enable_all \
+  --ca mesh_ca
+==========================
+
+k create namespace asm-ngw-ns
+k label namespace asm-ngw-ns istio-injection=enabled
+
+k apply -f $BASEPATH/gateways/istio-ingressgateway -n asm-ngw-ns
+#k delete -f $BASEPATH/gateways/istio-ingressgateway -n asm-ngw-ns
+
+k apply -f $BASEPATH/gateways/istio-egressgateway -n asm-ngw-ns
+#k delete -f $BASEPATH/gateways/istio-egressgateway -n asm-ngw-ns
+
+gcloud dns managed-zones update cloud-native-spoke-zone --networks=spoke-vpc,asm-vpc \
+--description="Private Zone"
+# gcloud dns managed-zones delete cloud-native-spoke-zone
+
+gcloud dns record-sets create smoke-mesh.internal.spoke.com. --rrdatas=14.0.0.100 --type=A --ttl=60 \
+--zone=cloud-native-spoke-zone
+# gcloud dns record-sets delete smoke-mesh.internal.spoke.com. --type=A --zone=cloud-native-spoke-zone
+
+gcloud dns record-sets create primary-mesh.internal.spoke.com. --rrdatas=14.0.0.100 --type=A --ttl=60 \
+--zone=cloud-native-spoke-zone
+# gcloud dns record-sets delete primary-mesh.internal.spoke.com. --type=A --zone=cloud-native-spoke-zone
+
+k create ns smoke
+k label namespace smoke istio-injection=enabled
+k label namespace istio-system istio-injection=enabled
+
+helm install smoke-tests-chart $BASEPATH/product-catalogue/smoke/smoke-tests-chart/ -n smoke \
+-f $BASEPATH/product-catalogue/smoke/smoke-tests-chart/values-smoke.yaml
+#helm uninstall smoke-tests-chart -n smoke
+
+k apply -f $ISTIOPATH/smoke-gateway.yaml -n smoke
+#k delete -f $ISTIOPATH/smoke-gateway.yaml -n smoke
+
+k create serviceaccount gke-smoke-sa -n smoke
+gcloud iam service-accounts add-iam-policy-binding $GSA \
+    --role=roles/iam.workloadIdentityUser \
+    --member="serviceAccount:$PROJECTID.svc.id.goog[default/gke-identity-sa]"
+k annotate serviceaccount gke-smoke-sa -n smoke iam.gke.io/gcp-service-account=$GSA
+curl -H "Metadata-Flavor: Google" http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/email
+
+#Secret for TLS for all namespaces
+k create secret tls primary-tls-secret -n asm-ngw-ns --cert="$ROOTPATH/misc/certs/<dns-name>/fullchain.pem" --key="$ROOTPATH/misc/certs/<dns-name>/privkey.pem"
+#k delete secret primary-tls-secret -n asm-ngw-ns
+
+k apply -f $BASEPATH/addons
+#k delete -f $BASEPATH/addons
+
+#k apply -f $ISTIOPATH/kiali-gateway.yaml -n istio-system
+#k delete -f $ISTIOPATH/kiali-gateway.yaml -n istio-system
+
+k create ns primary
+k label namespace primary istio-injection=enabled
+k apply -f $BASEPATH/product-catalogue/bookinfo/ -n primary
+#k delete -f $BASEPATH/product-catalogue/bookinfo/ -n primary
+
+k apply -f $ISTIOPATH/primary-gateway.yaml -n primary
+#k delete -f $ISTIOPATH/primary-gateway.yaml -n primary
+
+k apply -f $BASEPATH/product-catalogue/bluegreen/ -n primary
+#k delete -f $BASEPATH/product-catalogue/bluegreen/ -n primary
+k apply -f $ISTIOPATH/podinfo-destination-rule.yaml -n primary
+#k delete -f $ISTIOPATH/podinfo-destination-rule.yaml -n primary
+
+k apply -f $BASEPATH/product-catalogue/helloworld/ -n primary
+#k delete -f $BASEPATH/product-catalogue/helloworld/ -n primary
+k apply -f $ISTIOPATH/helloworld-destination-rule.yaml -n primary
+#k delete -f $ISTIOPATH/helloworld-destination-rule.yaml -n primary
+fortio load -c 5 -qps 0 -n 30 -loglevel Warning http://primary-mesh.<dns-name>/hello
+
+k apply -f $BASEPATH/product-catalogue/httpbin/httpbin.yaml -n primary
+#k delete -f $BASEPATH/product-catalogue/httpbin/httpbin.yaml -n primary
+k apply -f $ISTIOPATH/httpbin-destination-rule.yaml -n primary
+#k delete -f $ISTIOPATH/httpbin-destination-rule.yaml -n primary
+fortio load -c 1 -qps 0 -n 10 -loglevel Warning http://primary-mesh.<dns-name>/httpbin
+fortio load -c 2 -qps 0 -n 20 -loglevel Warning http://primary-mesh.<dns-name>/httpbin
+fortio load -c 4 -qps 0 -n 20 -loglevel Warning http://primary-mesh.<dns-name>/httpbin
+fortio load -c 7 -qps 0 -n 20 -loglevel Warning http://primary-mesh.<dns-name>/httpbin
+
+#k apply -f $ISTIOPATH/primary-serviceentry.yaml -n primary
+#k delete -f $ISTIOPATH/primary-serviceentry.yaml -n primary
+
+==================================================================
+Apigee X ASM
+=============
+AUTH="Authorization: Bearer $(gcloud auth print-access-token)"
+PROJECT_ID="cloud-native-project-spoke"
+RUNTIME_LOCATION="asia-southeast1"
+ANALYTICS_REGION="asia-southeast1"
+
+echo $AUTH
+echo $PROJECT_ID
+echo $RUNTIME_LOCATION
+echo $ANALYTICS_REGION
+
+gcloud compute networks subnets create asm-gke-apigee-subnet --network=asm-vpc --range=14.0.4.0/22
+# gcloud compute networks subnets delete asm-gke-apigee-subnet
+
+gcloud compute networks subnets create asm-gke-apigee-troublesdhoot-subnet --network=spoke-vpc --range=14.0.8.0/28
+# gcloud compute networks subnets delete asm-gke-apigee-troublesdhoot-subnet
+
+gcloud services enable apigee.googleapis.com \
+servicenetworking.googleapis.com compute.googleapis.com cloudkms.googleapis.com --project=$PROJECT_ID
+
+APIGEE_RANGE_NAME=asm-apigeex-svcs
+APIGEE_MANAGED_RANGE_NAME=asm-apigeex-managed-svcs
+NETWORK_NAME=asm-vpc
+
+gcloud compute addresses create $APIGEE_RANGE_NAME \
+  --global \
+  --prefix-length=22 \
+  --network=$NETWORK_NAME --purpose=VPC_PEERING --project=$PROJECT_ID
+# gcloud compute addresses delete $APIGEE_RANGE_NAME --global
+
+gcloud compute addresses create $APIGEE_MANAGED_RANGE_NAME \
+  --global \
+  --prefix-length=28 \
+  --network=$NETWORK_NAME --purpose=VPC_PEERING --project=$PROJECT_ID
+# gcloud compute addresses delete $APIGEE_MANAGED_RANGE_NAME --global
+
+gcloud services vpc-peerings connect \
+  --service=servicenetworking.googleapis.com \
+  --network=$NETWORK_NAME --ranges=$APIGEE_RANGE_NAME,$APIGEE_MANAGED_RANGE_NAME --project=$PROJECT_ID
+# gcloud services vpc-peerings delete servicenetworking-googleapis-com --network=$NETWORK_NAME
+
+gcloud alpha apigee organizations provision \
+  --runtime-location=$RUNTIME_LOCATION \
+  --analytics-region=$ANALYTICS_REGION \
+  --authorized-network=$NETWORK_NAME --project=$PROJECT_ID
+# gcloud alpha apigee organizations delete cloud-native-project-spoke
